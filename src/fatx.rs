@@ -5,7 +5,6 @@ use std::fs::{self, File};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Deref;
 use std::path::Path;
-use std::rc::Rc;
 
 const ENTRY_SIZE: usize = 0x40;
 const SECTOR_SIZE: usize = 0x200;
@@ -89,13 +88,6 @@ impl<'a> Partition<'a> {
         if data.len() < offset as usize {
             return Err(DiskError::InvalidDiskLength {
                 expected: offset as usize,
-                actual: data.len(),
-            });
-        }
-
-        if data.len() < offset as usize + len {
-            return Err(DiskError::InvalidDiskLength {
-                expected: offset as usize + len,
                 actual: data.len(),
             });
         }
@@ -192,15 +184,21 @@ impl<'a> Partition<'a> {
         let mut cursor = Cursor::new(self.data());
         let table_start = self.offset + 0x1000;
 
-        let final_block = match self.entry_size {
-            EntrySize::Fat16 => 0xffff,
-            EntrySize::Fat32 => 0xffffffff,
-        };
-
         let mut chain = vec![];
 
         let mut next = root;
-        while next != final_block {
+        loop {
+            match self.entry_size {
+                EntrySize::Fat16 => match next {
+                    0xffffusize | 0xfff8usize | 0x0 => break,
+                    _ => {}
+                },
+                EntrySize::Fat32 => match next {
+                    0xffffffffusize | 0xfffffff8usize | 0x0 => break,
+                    _ => {}
+                },
+            }
+
             debug!("next = 0x{:X}", next);
             chain.push(next);
 
@@ -251,6 +249,19 @@ impl Directory {
         partition: &Partition,
         name: String,
     ) -> Result<Directory, io::Error> {
+        if entry.block_chain().len() == 0 {
+            return Ok(Directory {
+                name: name,
+                entries: vec![],
+            });
+        }
+
+        println!(
+            "Reading directory with name {} at 0x{:X}",
+            name,
+            partition.block_offset(entry.block_chain[0]),
+        );
+
         let entries: Vec<Entry> = entry
             .block_chain
             .iter()
@@ -280,7 +291,6 @@ impl Directory {
             cursor.read(&mut entry_data)?;
 
             let entry = Entry::parse(partition, &entry_data, offset)?;
-            debug!("Entry: {:?}", entry);
             match entry {
                 Some(e) => entries.push(e),
                 None => break,
@@ -329,17 +339,23 @@ impl Entry {
         offset: u64,
     ) -> Result<Option<Self>, io::Error> {
         let mut cursor = Cursor::new(data);
+        debug!("Reading name length");
 
         // Figure out the name length
         let mut name_len = cursor.read_u8()?;
         // 0xFF or 0x00 are invalid
-        if name_len == 0xFF || name_len == 0x0 {
+        if name_len == 0xFF
+            || name_len == 0x0
+            || (name_len != DELETED_FILE_FLAG && name_len > MAX_FILENAME_LEN as u8)
+        {
             return Ok(None);
         }
         let is_deleted = name_len == DELETED_FILE_FLAG;
+        debug!("Reading attributes");
         // Read attributes
         let attributes = cursor.read_u8()?;
 
+        debug!("Reading bytes corresponding to the name");
         // Read the maximum number of bytes in a filename
         let mut name_bytes: [u8; MAX_FILENAME_LEN] = [0u8; MAX_FILENAME_LEN];
         cursor.read(&mut name_bytes)?;
@@ -355,26 +371,45 @@ impl Entry {
                     _ => continue,
                 }
             }
+
+            // Special case where the sequence is 0xe5 0x10 0x00
+            if name_len == 0 {
+                return Ok(None);
+            }
         }
 
         for b in &name_bytes[0..name_len as usize] {
-            if !char::from(*b).is_ascii() {
-                return Ok(None);
+            match b {
+                0x20 | 0x24 | 0x2E | 0x30..=0x39 | 0x41..=0x5a | 0x5f | 0x61..=0x7a => continue,
+                _ => {
+                    debug!("name contains invalid character: 0x{:X}", b);
+                    return Ok(None);
+                }
             }
         }
 
         // Convert the name to a string
         let name = String::from_utf8_lossy(&name_bytes[0..name_len as usize]);
+        println!("Parsed name: {}", name);
 
-        // Read the start bloc
+        debug!("Reading start block");
+
+        // Read the start block
         let block = cursor.read_u32::<BigEndian>()? as usize;
+        debug!("Reading file size");
         // Read the file size
         let file_size = cursor.read_u32::<BigEndian>()? as usize;
 
+        // if the file's bigger than 4GB, ignore
+        if file_size > 0x1024 * 0x1024 * 0x1024 * 4 {
+            return Ok(None);
+        }
+
         // From here we ignore the rest of the data
 
+        debug!("Reading block chain");
         // Read the block chain
-        let block_chain = if is_deleted {
+        let mut block_chain = if !is_deleted {
             partition.block_chain_from_root(block)?
         } else {
             let mut num_blocks = file_size / partition.cluster_size();
@@ -384,6 +419,23 @@ impl Entry {
 
             (block..=block + num_blocks).collect()
         };
+        debug!("Entry block chain before filtering: {:?}", block_chain);
+
+        for block in &mut block_chain {
+            if *block == 0 {
+                continue;
+            }
+
+            if partition.block_offset(*block) > partition.data().len() as u64 {
+                *block = 0x0;
+            }
+        }
+
+        // hax
+        block_chain.retain(|b| *b != 0);
+
+        debug!("Returning parsed entry");
+        debug!("Entry block chain: {:?}", block_chain);
 
         let parsed_entry = Entry {
             offset,
@@ -411,8 +463,25 @@ impl Entry {
     }
 
     pub fn write_to_file(&self, path: &Path, partition: &Partition) -> Result<(), io::Error> {
+        if path.exists() {
+            return Ok(());
+        }
+
         if !path.parent().unwrap().exists() {
             fs::create_dir(path.parent().unwrap())?;
+        }
+
+        for block in self.block_chain() {
+            if *block == 0 {
+                return Ok(());
+            }
+
+            let block_offset = partition.block_offset(*block);
+            if block_offset > partition.offset() + partition.len() as u64
+                || block_offset > partition.data().len() as u64
+            {
+                return Ok(());
+            }
         }
 
         let mut file = File::create(path)?;
@@ -427,6 +496,10 @@ impl Entry {
         file.write(&all_data)?;
 
         Ok(())
+    }
+
+    pub fn block_chain(&self) -> &[usize] {
+        self.block_chain.as_slice()
     }
 }
 

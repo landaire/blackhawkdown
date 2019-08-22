@@ -1,11 +1,15 @@
+#![feature(thread_spawn_unchecked)]
+
 #[macro_use]
 extern crate bitflags;
 #[macro_use]
 extern crate log;
 
+use byteorder::{BigEndian, ByteOrder, LittleEndian, ReadBytesExt};
 use memmap::MmapOptions;
+use std::cmp;
 use std::fs::{self, File};
-use std::io::Cursor;
+use std::io::{self, Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use structopt::StructOpt;
@@ -23,7 +27,7 @@ struct Opt {
     output: PathBuf,
 }
 
-fn main() -> Result<(), std::io::Error> {
+fn main() -> Result<(), io::Error> {
     env_logger::init();
 
     let opt = Opt::from_args();
@@ -56,27 +60,93 @@ fn main() -> Result<(), std::io::Error> {
             })
             .collect();
 
-        let deleted_entries = scanners::find_deleted_files(
+        let end_offset = cmp::min(partition.offset() as usize + partition.len(), mmap.len());
+
+        let deleted_files = scanners::find_deleted_files(
             &mmap,
             partition.offset(),
-            partition.offset() + partition.len() as u64,
+            end_offset as u64,
             &all_entries,
             partition,
         );
 
-        for entry in &deleted_entries {
-            let path = Path::new(partition.name());
+        println!("Done scanning for deleted files");
 
-            if entry.is_dir() {
-                let dir = &fatx::Directory::parse(entry, partition, entry.name().to_owned())
-                    .expect("could not parse directory");
+        let mut video_files = 0;
 
-                print_dir(&dir, &path, partition, &opt.output);
-            } else {
-                entry.write_to_file(&opt.output.join(entry.name()), partition);
+        for file in &deleted_files {
+            let path = opt.output.join(Path::new(partition.name()));
+            let deleted_files_path = opt.output.join("deleted_files");
+            if !deleted_files_path.exists() {
+                fs::create_dir(&deleted_files_path);
+            }
+
+            match file {
+                scanners::DeletedFileType::FatxEntry(entry) => {
+                    if entry.is_dir() {
+                        let dir =
+                            &fatx::Directory::parse(entry, partition, entry.name().to_owned())
+                                .expect("could not parse directory");
+
+                        print_dir(&dir, &path, partition, &deleted_files_path);
+                    } else {
+                        entry.write_to_file(&opt.output.join(entry.name()), partition);
+                    }
+                }
+                scanners::DeletedFileType::STFS(offset) => {
+                    // get the file name
+                    let mut chars: Vec<u16> = vec![];
+                    let mut cursor = Cursor::new(&mmap);
+                    cursor.seek(SeekFrom::Start(*offset + 0x411))?;
+
+                    for _i in (0..0x411).step_by(2) {
+                        let c = cursor.read_u16::<BigEndian>()?;
+                        if c == 0x0 {
+                            break;
+                        }
+
+                        chars.push(c);
+                    }
+
+                    let display_name = String::from_utf16(chars.as_slice());
+                    if display_name.is_err() {
+                        continue;
+                    }
+
+                    let display_name = display_name.unwrap();
+                    println!(
+                        "Got STFS package at offset 0x{:X} with name: {}",
+                        offset, display_name
+                    );
+
+                    //write_file_with_raw_bytes(opt.output.join(display_name), &mmap[offset..])
+                }
+                scanners::DeletedFileType::XEX(offset) => {}
+                scanners::DeletedFileType::Bink(offset) => {
+                    println!("Got a bink file at offset 0x{:X}", offset);
+                    // get the file size
+                    let file_size =
+                        LittleEndian::read_u32(&mmap[*offset as usize..*offset as usize + 0x4])
+                            as usize;
+
+                    println!("File size is 0x{:X}", file_size);
+
+                    write_file_with_raw_bytes(
+                        &deleted_files_path.join(format!("video_file_{}.bik", video_files)),
+                        &mmap[*offset as usize..*offset as usize + file_size + 0x8],
+                    )?;
+                    video_files += 1;
+                }
             }
         }
     }
+
+    Ok(())
+}
+
+fn write_file_with_raw_bytes(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
+    let mut file = File::create(path)?;
+    file.write(bytes)?;
 
     Ok(())
 }
@@ -87,6 +157,7 @@ fn print_dir(
     partition: &fatx::Partition,
     output_dir: &Path,
 ) {
+    println!("Printing dir: {}", dir.name());
     let this_dir_path = if dir.name() == "/" {
         parent_path.join("")
     } else {
