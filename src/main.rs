@@ -73,6 +73,7 @@ fn main() -> Result<(), io::Error> {
         println!("Done scanning for deleted files");
 
         let mut video_files = 0;
+        let mut stfs_files = 0;
 
         for file in &deleted_files {
             let path = opt.output.join(Path::new(partition.name()));
@@ -119,7 +120,42 @@ fn main() -> Result<(), io::Error> {
                         offset, display_name
                     );
 
-                    //write_file_with_raw_bytes(opt.output.join(display_name), &mmap[offset..])
+                    cursor.seek(SeekFrom::Start(*offset + 0x34c))?;
+                    let content_size = cursor.read_u64::<BigEndian>()?;
+
+                    cursor.seek(SeekFrom::Start(*offset + 0x37e))?;
+                    // just read from here and see if we hit some non-null data
+                    loop {
+                        let data = cursor.read_u32::<BigEndian>()?;
+                        if data != 0 {
+                            break;
+                        }
+                    }
+
+                    let content_start_offset = cursor.position() - 0x4;
+
+                    if content_start_offset + content_size > mmap.len() as u64 {
+                        println!(
+                            "File has invalid length of 0x{:X} (start offset = 0x{:X})",
+                            content_size,
+                            content_start_offset - offset
+                        );
+                        continue;
+                    }
+
+                    let file_path = if display_name.is_empty() {
+                        stfs_files += 1;
+                        deleted_files_path.join(format!("unnamed_stfs_package_{}", stfs_files))
+                    } else {
+                        deleted_files_path.join(&display_name)
+                    };
+
+                    println!("Writing STFS file to {}", file_path.display());
+
+                    write_file_with_raw_bytes(
+                        &file_path,
+                        &mmap[*offset as usize..(content_start_offset + content_size) as usize],
+                    )?;
                 }
                 scanners::DeletedFileType::XEX(offset) => {}
                 scanners::DeletedFileType::Bink(offset) => {

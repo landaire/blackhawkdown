@@ -81,7 +81,12 @@ pub fn find_deleted_files(
                         let magic =
                             BigEndian::read_u32(&data[current_offset..current_offset + 0x4]);
                         for m in &magics {
-                            if magic == *m && data[current_offset + 0x5] != 0x20 {
+                            if magic == *m {
+                                match data[current_offset + 0x5] {
+                                    0x20 | 0x2e => break,
+                                    _ => {}
+                                }
+
                                 let mut is_known = false;
                                 for entry in known_files {
                                     if entry.offset() == current_offset as u64 {

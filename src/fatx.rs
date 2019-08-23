@@ -371,11 +371,11 @@ impl Entry {
                     _ => continue,
                 }
             }
+        }
 
-            // Special case where the sequence is 0xe5 0x10 0x00
-            if name_len == 0 {
-                return Ok(None);
-            }
+        // Special case where the sequence is 0xe5 0x10 0x00
+        if name_len == 0 {
+            return Ok(None);
         }
 
         for b in &name_bytes[0..name_len as usize] {
@@ -390,6 +390,9 @@ impl Entry {
 
         // Convert the name to a string
         let name = String::from_utf8_lossy(&name_bytes[0..name_len as usize]);
+        if name.len() == 0 {
+            return Ok(None);
+        }
         println!("Parsed name: {}", name);
 
         debug!("Reading start block");
